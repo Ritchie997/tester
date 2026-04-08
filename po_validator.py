@@ -48,19 +48,30 @@ PATTERNS = {
     "html_tag": re.compile(r"<[^>]+>"),  # <tag>, </tag>, etc.
 }
 
-SYSTEM_PROMPT = """You are a strict translation QA validator. You analyze English-to-Russian pairs. Output ONLY valid JSON. No explanations, no markdown, no code blocks."""
+SYSTEM_PROMPT = """You are a strict Translation QA Validator for game localization (EN->RU).
+Your goal is to find CRITICAL semantic errors that break the game experience or mislead the player.
+Output ONLY valid JSON. No markdown, no explanations.
 
-USER_PROMPT_TEMPLATE = """Check semantic correctness of this translation pair.
+Rules for analysis:
+1. IGNORE stylistic differences, sentence restructuring, or changes in tone if the meaning is preserved.
+2. IGNORE localization adaptations: shortening long game titles (e.g., "Cataclysm: The Last Generation" -> "Катаклизм") is acceptable if context is clear.
+3. IGNORE minor omissions of filler words if the core instruction remains accurate.
+4. FLAG as incorrect ONLY if:
+   - The translation states the OPPOSITE meaning (e.g., "safe" -> "dangerous").
+   - A critical gameplay instruction is lost or changed (e.g., "press X" is missing, or "don't do Y" becomes "do Y").
+   - The translation contains HALLUCINATIONS (facts not present in source).
+   - Key technical terms/stats are mistranslated causing confusion.
+5. Return format: {"is_correct": boolean, "reason": "string or null"}
+   - If correct: {"is_correct": true, "reason": null}
+   - If incorrect: {"is_correct": false, "reason": "Brief explanation of the CRITICAL error"}
+"""
+
+USER_PROMPT_TEMPLATE = """Analyze this game localization pair.
 SOURCE: {msgid}
 TARGET: {msgstr}
 
-Rules:
-1. Does TARGET convey the EXACT same meaning as SOURCE? (Flag obvious mismatches like 'hello' → 'как дела?')
-2. Ignore minor stylistic differences. Focus on meaning, context, and key terms.
-3. Return ONLY this JSON format:
-{{"is_correct": boolean, "reason": "string or null"}}
-If correct: {{"is_correct": true, "reason": null}}
-If incorrect: {{"is_correct": false, "reason": "brief 1-sentence explanation of mismatch"}}"""
+Apply the strict critical-error rules. Is the translation safe to use?
+Return ONLY JSON:"""
 
 
 # =============================================================================
