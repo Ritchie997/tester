@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ RETRY_DELAYS = [1, 2, 4]
 RESUME_STATE_FILE = "resume_state.json"
 DEFAULT_OUTPUT_PO = "validated_output.po"
 DEFAULT_ISSUES_JSONL = "issues.jsonl"
+CHECKPOINT_INTERVAL = 100  # Save checkpoint every N entries
 
 # Regex patterns for structural validation
 PATTERNS = {
@@ -261,7 +263,7 @@ def load_resume_state(resume_file: str) -> dict:
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"last_index": -1, "issues": [], "processed_count": 0, "error_count": 0}
+    return {"last_index": -1, "issues": [], "processed_count": 0, "error_count": 0, "total_to_process": None}
 
 
 def save_resume_state(state: dict, resume_file: str) -> None:
@@ -275,6 +277,16 @@ def clear_resume_state(resume_file: str) -> None:
     path = Path(resume_file)
     if path.exists():
         path.unlink()
+
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global shutdown_requested
+    shutdown_requested = True
+    logging.info("\nInterrupt signal received. Will save checkpoint after current entry...")
 
 
 # =============================================================================
@@ -306,6 +318,7 @@ def process_po_file(
     model: str,
     timeout: int,
     resume: bool,
+    limit: Optional[int],
     logger: logging.Logger
 ) -> None:
     """Main processing function."""
@@ -314,7 +327,15 @@ def process_po_file(
     logger.info(f"Loading PO file: {input_path}")
     po_file = polib.pofile(input_path, encoding="utf-8")
     total_entries = len(po_file)
-    logger.info(f"Total entries: {total_entries}")
+    logger.info(f"Total entries in file: {total_entries}")
+    
+    # Determine how many entries to process
+    if limit is not None:
+        entries_to_process = min(limit, total_entries)
+        logger.info(f"Processing up to {entries_to_process} entries (limit specified)")
+    else:
+        entries_to_process = total_entries
+        logger.info(f"Processing all {total_entries} entries")
     
     # Initialize or load resume state
     if resume:
@@ -323,9 +344,13 @@ def process_po_file(
         issues = state["issues"]
         processed_count = state["processed_count"]
         error_count = state["error_count"]
+        # Check if limit changed from previous run
+        prev_limit = state.get("total_to_process")
+        if prev_limit is not None and limit != prev_limit:
+            logger.info(f"Limit changed from {prev_limit} to {limit}. Continuing from index {start_index}.")
         logger.info(f"Resuming from index {start_index} (previously processed: {processed_count})")
     else:
-        state = {"last_index": -1, "issues": [], "processed_count": 0, "error_count": 0}
+        state = {"last_index": -1, "issues": [], "processed_count": 0, "error_count": 0, "total_to_process": limit}
         start_index = 0
         issues = []
         processed_count = 0
@@ -333,12 +358,23 @@ def process_po_file(
         # Clear any existing resume file
         clear_resume_state(resume_path)
     
+    # Calculate end index based on limit
+    end_index = min(start_index + (entries_to_process - start_index), total_entries)
+    if limit is not None and not resume:
+        end_index = min(limit, total_entries)
+    elif limit is not None and resume:
+        # When resuming with a new limit, recalculate
+        remaining = limit - processed_count
+        end_index = min(start_index + remaining, total_entries)
+    
+    logger.info(f"Will process entries from index {start_index} to {end_index - 1}")
+    
     # Track which entries need #freez flag (for post-processing)
     freez_indices = {issue["index"] for issue in issues}
     
     # Process entries with progress bar
-    with tqdm(total=total_entries, initial=start_index, desc="Validating", unit="entry") as pbar:
-        for idx in range(start_index, total_entries):
+    with tqdm(total=end_index, initial=start_index, desc="Validating", unit="entry") as pbar:
+        for idx in range(start_index, end_index):
             entry = po_file[idx]
             
             # Skip entries without msgid or msgstr
@@ -404,17 +440,25 @@ def process_po_file(
             state["issues"] = issues
             state["processed_count"] = processed_count + 1
             state["error_count"] = error_count
+            state["total_to_process"] = limit
             
-            # Save checkpoint every 100 entries
-            if (idx + 1) % 100 == 0:
+            # Save checkpoint every N entries or on shutdown request
+            if (idx + 1) % CHECKPOINT_INTERVAL == 0 or shutdown_requested:
                 save_resume_state(state, resume_path)
+                if shutdown_requested:
+                    logger.info(f"Checkpoint saved at index {idx}. Stopping gracefully.")
+                    break
             
             processed_count += 1
             pbar.update(1)
             
             # Update progress bar description with stats
-            rate = pbar.format_interval(pbar.format_dict["elapsed"])
-            pbar.set_postfix({"errors": error_count, "rate": f"{processed_count/max(1, float(pbar.format_dict['elapsed'])):.1f}/s"})
+            elapsed = float(pbar.format_dict["elapsed"]) or 0.1
+            pbar.set_postfix({"errors": error_count, "rate": f"{processed_count/elapsed:.1f}/s"})
+        
+        # Check if we stopped due to shutdown
+        if shutdown_requested:
+            logger.info("Graceful stop completed. Use --resume to continue.")
     
     # Apply #freez flags to PO file
     logger.info("Applying #freez flags to problematic entries...")
@@ -489,6 +533,12 @@ Examples:
         help="Resume from last checkpoint"
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of entries to process (e.g., --limit 1000 for first 1000 entries)"
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"Ollama model to use (default: {DEFAULT_MODEL})"
@@ -509,6 +559,10 @@ Examples:
     
     # Setup logging
     logger = setup_logging(args.verbose)
+    
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Validate input file
     input_path = Path(args.input)
@@ -543,13 +597,15 @@ Examples:
             model=args.model,
             timeout=args.timeout,
             resume=args.resume,
+            limit=args.limit,
             logger=logger
         )
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user. State saved for resume.")
-        sys.exit(130)
     except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
+        logger.exception(f"Unexpected error during validation: {e}")
+        # Save state on unexpected error
+        if 'state' in locals():
+            save_resume_state(state, args.resume_state)
+            logger.info(f"State saved to {args.resume_state} for recovery")
         sys.exit(1)
 
 
